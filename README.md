@@ -4,7 +4,8 @@ Here are a set of tools I've created that help my workflows.
 
 1. **Geofabrik tools** - a set of tools that will rename, clip, merge or a combination of all three the OSM data from Geofabrik.
 2. **Geofabrik Placename Translator** - Creates a settlement dataset from the OSM data with similar attributes to that of Geofabrik but includes the English name attribute alongside the default local name. French, Spanish and Arabic names can also be included.
-3. **OpenStreetMap Admin Processing** - Clipping and renaming the admin 0 data to an area of interest
+3. **OpenStreetMap Admin Processing** - Clipping and renaming the admin 0 data to an area of interest.
+4. **Extra OpenStreetMap Data** - Extra OSM data currently not in Geofabrik.
 
 ## Natural Earth Data
 
