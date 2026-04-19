@@ -12,7 +12,8 @@ class Toolbox(object):
         self.tools = [
             DownloadFerryRoutes,
             DownloadSurfaceTypes,
-            DownloadMaritimeFeatures
+            DownloadMaritimeFeatures,
+            DownloadPeaks
         ]
 
 
@@ -673,6 +674,197 @@ class DownloadMaritimeFeatures(object):
         if do_join and join_target:
             out_fc = _run_spatial_join(out_fc, output_loc, output_name, join_target, join_fields, messages)
 
+        parameters[9].value = out_fc
+        if add_to_map:
+            _add_to_map(out_fc, messages)
+
+
+# ============================================================
+# Tool 4 — Peaks, Volcanoes and Hills
+# ============================================================
+
+class DownloadPeaks(object):
+    def __init__(self):
+        self.label = "Download Peaks, Volcanoes and Hills"
+        self.description = (
+            "Downloads peaks, volcanoes and hills from OpenStreetMap (OSM) using the "
+            "Overpass API and saves them as a Point Z feature class matching the "
+            "Geofabrik attribute style.\n\n"
+            "Features are mapped in OSM using the natural= tag:\n"
+            "  - peak (code 4111): The summit or highest point of a mountain or hill. "
+            "Positioned at the highest point of an elevated landform.\n"
+            "  - volcano (code 4112): A volcanic peak or vent, active, dormant or "
+            "extinct. Includes shield volcanoes, cinder cones and stratovolcanoes.\n"
+            "  - hill (code 4114): A smaller elevated landform, generally lower and "
+            "with gentler slopes than a mountain peak.\n\n"
+            "Attributes captured (Geofabrik style):\n"
+            "  - osm_id: The unique OpenStreetMap node ID.\n"
+            "  - code: Geofabrik numeric feature code (4111, 4112 or 4114).\n"
+            "  - fclass: The OSM natural tag value (peak, volcano or hill).\n"
+            "  - name: The name of the feature as recorded in OSM.\n"
+            "  - elevation: Elevation in metres above sea level from the OSM ele tag. "
+            "Used as the Z value on the geometry. May be null where not recorded.\n\n"
+            "Output is a Point Z feature class in WGS84 (EPSG:4326)."
+        )
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        return _build_parameters(
+            join_target_name="join_target_pea",
+            name_example="gbr_phys_top_pt_s0_openstreetmap_pp_peaks",
+            name_convention="{geoextent}_phys_top_pt_s0_openstreetmap_pp_peaks"
+        )
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        _update_common_parameters(parameters, "_phys_top_pt_s0_openstreetmap_pp_peaks")
+
+    def updateMessages(self, parameters):
+        _update_common_messages(parameters)
+
+    def execute(self, parameters, messages):
+        aoi         = parameters[0].value
+        bbox_str    = parameters[1].valueAsText
+        output_loc  = parameters[2].valueAsText
+        geo_extent  = parameters[3].valueAsText.strip().lower()
+        add_to_map  = parameters[5].value
+        do_join     = parameters[6].value
+        join_target = parameters[7].valueAsText
+        join_fields = parameters[8].valueAsText
+
+        safe = _safe_extent(geo_extent)
+        output_name = f"{safe}_phys_top_pt_s0_openstreetmap_pp_peaks"
+        messages.addMessage(f"Output will be saved as: {output_name}")
+
+        # Geofabrik codes per fclass
+        fclass_codes = {
+            "peak":    4111,
+            "volcano": 4112,
+            "hill":    4114,
+        }
+
+        # ----------------------------------------------------------------
+        # 1. Bounding box
+        # ----------------------------------------------------------------
+        sr_wgs84 = arcpy.SpatialReference(4326)
+        if aoi:
+            messages.addMessage("Calculating bounding box from AOI layer...")
+            south, west, north, east = _get_bbox(aoi, messages)
+        else:
+            parts = [float(x.strip()) for x in bbox_str.split(",")]
+            south, west, north, east = parts[0], parts[1], parts[2], parts[3]
+        messages.addMessage(f"Bounding box: South={south}, West={west}, North={north}, East={east}")
+
+        # ----------------------------------------------------------------
+        # 2. Overpass query — nodes tagged natural=peak/volcano/hill
+        # ----------------------------------------------------------------
+        query = f"""
+[out:json][timeout:90];
+(
+  node["natural"="peak"]({south},{west},{north},{east});
+  node["natural"="volcano"]({south},{west},{north},{east});
+  node["natural"="hill"]({south},{west},{north},{east});
+);
+out body;
+"""
+        messages.addMessage("Querying Overpass API for peaks, volcanoes and hills...")
+        osm_data = _query_overpass(query, "ArcGIS-OSM-PeaksTool/1.0", messages)
+        elements = osm_data.get("elements", [])
+        messages.addMessage(f"Received {len(elements)} OSM elements.")
+        if not elements:
+            messages.addWarningMessage("No peaks, volcanoes or hills found in the specified area.")
+            return
+
+        # ----------------------------------------------------------------
+        # 3. Build point geometries and attributes
+        # ----------------------------------------------------------------
+        # rows: (osm_id, fclass, code, name, elev_val, lon, lat)
+        rows = []
+        for elem in elements:
+            if elem.get("type") != "node":
+                continue
+            lat = elem.get("lat")
+            lon = elem.get("lon")
+            if lat is None or lon is None:
+                continue
+            tags   = elem.get("tags", {})
+            fclass = tags.get("natural", "")
+            code   = fclass_codes.get(fclass, 0)
+            name   = tags.get("name", "")
+            osm_id = str(elem.get("id", ""))
+
+            elev_val = None
+            ele_str  = tags.get("ele", "")
+            if ele_str:
+                try:
+                    # Strip any non-numeric suffixes (e.g. "979 m" or "979m")
+                    elev_val = float(ele_str.strip().split()[0].replace(",", "."))
+                except (ValueError, IndexError):
+                    pass
+
+            rows.append((osm_id, fclass, code, name, elev_val, lon, lat))
+
+        if not rows:
+            messages.addWarningMessage("No valid point geometry could be built.")
+            return
+
+        # Log per-type counts
+        for fc in fclass_codes:
+            messages.addMessage(f"  {fc}: {sum(1 for r in rows if r[1] == fc)} features")
+        messages.addMessage(f"Total features built: {len(rows)}")
+        messages.addMessage(f"  With name: {sum(1 for r in rows if r[3])}")
+        messages.addMessage(f"  With elevation: {sum(1 for r in rows if r[4] is not None)}")
+
+        # ----------------------------------------------------------------
+        # 4. Create Point Z feature class
+        # ----------------------------------------------------------------
+        out_fc = os.path.join(output_loc, output_name)
+        if arcpy.Exists(out_fc):
+            arcpy.management.Delete(out_fc)
+        arcpy.management.CreateFeatureclass(
+            output_loc, output_name, "POINT",
+            has_z="ENABLED",
+            spatial_reference=sr_wgs84
+        )
+        arcpy.management.AddField(out_fc, "osm_id",    "TEXT",   field_length=20,  field_alias="OSM ID")
+        arcpy.management.AddField(out_fc, "code",      "SHORT",                    field_alias="Code")
+        arcpy.management.AddField(out_fc, "fclass",    "TEXT",   field_length=28,  field_alias="Feature Class")
+        arcpy.management.AddField(out_fc, "name",      "TEXT",   field_length=100, field_alias="Name")
+        arcpy.management.AddField(out_fc, "elevation", "DOUBLE",                   field_alias="Elevation (m)")
+
+        # ----------------------------------------------------------------
+        # 5. Insert features
+        # ----------------------------------------------------------------
+        fields = ["SHAPE@", "osm_id", "code", "fclass", "name", "elevation"]
+        with arcpy.da.InsertCursor(out_fc, fields) as cur:
+            for (osm_id, fclass, code, name, elev_val, lon, lat) in rows:
+                z = elev_val if elev_val is not None else 0.0
+                geom = arcpy.PointGeometry(
+                    arcpy.Point(lon, lat, z), sr_wgs84, has_z=True
+                )
+                cur.insertRow((
+                    geom,
+                    osm_id[:20]  if osm_id else "",
+                    code,
+                    fclass[:28]  if fclass else "",
+                    name[:100]   if name   else "",
+                    elev_val
+                ))
+
+        count = int(arcpy.management.GetCount(out_fc)[0])
+        messages.addMessage(f"Successfully created: {out_fc} with {count} features.")
+
+        # ----------------------------------------------------------------
+        # 6. Spatial join (optional)
+        # ----------------------------------------------------------------
+        if do_join and join_target:
+            out_fc = _run_spatial_join(out_fc, output_loc, output_name, join_target, join_fields, messages)
+
+        # ----------------------------------------------------------------
+        # 7. Set output & add to map
+        # ----------------------------------------------------------------
         parameters[9].value = out_fc
         if add_to_map:
             _add_to_map(out_fc, messages)
