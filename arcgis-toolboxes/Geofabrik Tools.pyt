@@ -11,8 +11,48 @@ class Toolbox(object):
         self.tools = [RenameGeofabrik, MergeRenameGeofabrik, ClipRenameGeofabrik, MergeClipRenameGeofabrik]
 
 # ---------------------------------------------------------
-# FINAL MAPPING TABLE: (Output Template, Group, Layer Order)
+# INPUT TYPE HANDLING (NEW)
 # ---------------------------------------------------------
+
+def detect_input_type(path):
+    p = path.lower()
+    if p.endswith(".gpkg"):
+        return "gpkg"
+    if p.endswith(".osm.pbf"):
+        return "pbf"
+    if os.path.isdir(path):
+        return "folder"
+    raise ValueError("Unsupported input type: {}".format(path))
+
+
+def load_pbf_to_gdb(pbf_path):
+    tmp_gdb = arcpy.CreateUniqueName("osm_tmp.gdb", arcpy.env.scratchFolder)
+    arcpy.management.CreateFileGDB(arcpy.env.scratchFolder, os.path.basename(tmp_gdb))
+
+    arcpy.conversion.OSMFileLoader(
+        in_osm_file=pbf_path,
+        out_feature_dataset=tmp_gdb,
+        add_relations="ADD_RELATIONS"
+    )
+
+    return tmp_gdb
+
+
+def normalize_input_workspace(in_ws):
+    typ = detect_input_type(in_ws)
+
+    if typ in ("folder", "gpkg"):
+        return in_ws
+
+    if typ == "pbf":
+        return load_pbf_to_gdb(in_ws)
+
+    return in_ws
+
+# ---------------------------------------------------------
+# FINAL MAPPING TABLE
+# ---------------------------------------------------------
+
 LAYER_CONFIG = {
     "gis_osm_places_free": ("{geoextent}_stle_stl_pt_s0_openstreetmap_pp_settlements", "Settlements", 1),
     "gis_osm_pois_free": ("{geoextent}_pois_poi_pt_s0_openstreetmap_pp_pointsofinterest", "POIs", 2),
@@ -37,9 +77,8 @@ LAYER_CONFIG = {
 }
 
 def resolve_mapping(internal_name):
-    """Normalizes Geopackage/Shapefile names and retrieves config."""
     clean = internal_name.replace("main.", "").strip()
-    if clean.endswith("_1"): 
+    if clean.endswith("_1"):
         clean = clean[:-2]
     if "_free" not in clean and "_free" in internal_name:
         clean = clean + "_free"
@@ -48,42 +87,40 @@ def resolve_mapping(internal_name):
 # ---------------------------------------------------------
 # CORE LOGIC
 # ---------------------------------------------------------
+
 def copy_and_group(src, dest_ws, new_name, group_name, add_to_map):
     desc = arcpy.Describe(src)
+
     is_container = dest_ws.lower().endswith((".gdb", ".gpkg"))
     clean_name = arcpy.ValidateTableName(new_name, dest_ws)
-    dest_path = os.path.join(dest_ws, clean_name)
-    
-    # Data Copy
+
+    if is_container:
+        dest_path = os.path.join(dest_ws, clean_name)
+    else:
+        dest_path = os.path.join(dest_ws, clean_name + ".shp")
+
     if desc.dataType in ["FeatureClass", "ShapeFile"]:
-        if not is_container: dest_path += ".shp"
         arcpy.management.CopyFeatures(src, dest_path)
     elif desc.dataType == "RasterDataset":
         arcpy.management.CopyRaster(src, dest_path)
-    
-    # Mapping Logic
+
     if add_to_map:
         try:
             aprx = arcpy.mp.ArcGISProject("CURRENT")
             m = aprx.activeMap
             if m:
-                # 1. Find or create the group layer
                 target_group = next((g for g in m.listLayers(group_name) if g.isGroupLayer), None)
                 if not target_group:
                     target_group = m.createGroupLayer(group_name)
-                
-                # Ensure group is expanded
                 target_group.expanded = True
-                
-                # 2. Add layer to the map
                 new_lyr = m.addDataFromPath(dest_path)
-                
-                # 3. Move into group (Adding to TOP ensures Layer 1 ends up on top after sorted processing)
                 m.addLayerToGroup(target_group, new_lyr, "TOP")
                 m.removeLayer(new_lyr)
         except Exception as e:
             arcpy.AddWarning("TOC Error: {}".format(e))
+
     return dest_path
+
 
 def run_sj(working, lyr, typ, flds):
     fm = arcpy.FieldMappings()
@@ -96,6 +133,7 @@ def run_sj(working, lyr, typ, flds):
     out = arcpy.CreateUniqueName("sj_tmp", arcpy.env.scratchGDB)
     return arcpy.analysis.SpatialJoin(working, lyr, out, "JOIN_ONE_TO_ONE", "KEEP_ALL", fm, typ)[0]
 
+
 def make_sj_params():
     p1 = arcpy.Parameter(name="do_sj", displayName="Spatial Join", datatype="GPBoolean", parameterType="Optional", direction="Input")
     p2 = arcpy.Parameter(name="sj_lyr", displayName="Join Layer", datatype="GPFeatureLayer", parameterType="Optional", direction="Input")
@@ -104,6 +142,7 @@ def make_sj_params():
     p4 = arcpy.Parameter(name="sj_fld", displayName="Join Fields", datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
     p2.enabled = p3.enabled = p4.enabled = False
     return p1, p2, p3, p4
+
 
 def make_common():
     p1 = arcpy.Parameter(name="add_map", displayName="Add to Map", datatype="GPBoolean", parameterType="Optional", direction="Input")
@@ -114,95 +153,153 @@ def make_common():
 # ---------------------------------------------------------
 # TOOLS
 # ---------------------------------------------------------
+
 class RenameGeofabrik(object):
     def __init__(self): self.label = "1. Rename Geofabrik"
+
     def getParameterInfo(self):
-        return [arcpy.Parameter(name="in_ws", displayName="Input Workspace", datatype="DEWorkspace", parameterType="Required", direction="Input"),
-                arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input")] + list(make_sj_params()) + list(make_common())
+        return [
+            arcpy.Parameter(name="in_ws", displayName="Input Workspace (folder, gpkg, or pbf)", datatype="DEWorkspace", parameterType="Required", direction="Input"),
+            arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input")
+        ] + list(make_sj_params()) + list(make_common())
+
     def updateParameters(self, params):
         params[3].enabled = params[4].enabled = params[5].enabled = bool(params[2].value)
+
     def execute(self, params, messages):
-        in_ws, geo, out_ws, add_map = params[0].valueAsText, params[1].valueAsText, params[7].valueAsText, params[6].value
+        raw_ws = params[0].valueAsText
+        in_ws = normalize_input_workspace(raw_ws)
+
         arcpy.env.workspace = in_ws
+        geo = params[1].valueAsText
+        out_ws = params[7].valueAsText
+        add_map = params[6].value
+
         fcs = sorted(arcpy.ListFeatureClasses() or [], key=lambda x: resolve_mapping(x)[2], reverse=True)
+
         for ds in fcs:
             template, group, l_order = resolve_mapping(ds)
             if template:
                 new_name = template.format(geoextent=geo)
                 working = os.path.join(in_ws, ds)
-                if params[2].value: 
+                if params[2].value:
                     working = run_sj(working, params[3].valueAsText, params[4].valueAsText, params[5].values)
                 copy_and_group(working, out_ws, new_name, group, add_map)
 
+
 class MergeRenameGeofabrik(object):
     def __init__(self): self.label = "2. Merge + Rename Geofabrik"
+
     def getParameterInfo(self):
-        return [arcpy.Parameter(name="in_ws", displayName="Input Workspaces", datatype="DEWorkspace", parameterType="Required", direction="Input", multiValue=True),
-                arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input")] + list(make_sj_params()) + list(make_common())
+        return [
+            arcpy.Parameter(name="in_ws", displayName="Input Workspaces (folder, gpkg, or pbf)", datatype="DEWorkspace", parameterType="Required", direction="Input", multiValue=True),
+            arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input")
+        ] + list(make_sj_params()) + list(make_common())
+
     def updateParameters(self, params):
         params[3].enabled = params[4].enabled = params[5].enabled = bool(params[2].value)
+
     def execute(self, params, messages):
-        in_wss, geo, out_ws, add_map = params[0].values, params[1].valueAsText, params[7].valueAsText, params[6].value
+        raw_wss = params[0].values
+        in_wss = [normalize_input_workspace(ws) for ws in raw_wss]
+
+        geo = params[1].valueAsText
+        out_ws = params[7].valueAsText
+        add_map = params[6].value
+
         groups_dict = defaultdict(list)
+
         for ws in in_wss:
             arcpy.env.workspace = ws
             for fc in arcpy.ListFeatureClasses() or []:
                 key = fc.replace("main.", "").replace("_1", "")
-                if "_free" not in key and "_free" in fc: key += "_free"
+                if "_free" not in key and "_free" in fc:
+                    key += "_free"
                 groups_dict[key].append(os.path.join(ws, fc))
-        
+
         sorted_keys = sorted(groups_dict.keys(), key=lambda k: resolve_mapping(k)[2], reverse=True)
+
         for key in sorted_keys:
             template, group, l_order = resolve_mapping(key)
             if template:
                 new_name = template.format(geoextent=geo)
                 merged = arcpy.management.Merge(groups_dict[key], arcpy.CreateUniqueName("m", arcpy.env.scratchGDB))
                 working = merged
-                if params[2].value: 
+                if params[2].value:
                     working = run_sj(working, params[3].valueAsText, params[4].valueAsText, params[5].values)
                 copy_and_group(working, out_ws, new_name, group, add_map)
 
+
 class ClipRenameGeofabrik(object):
     def __init__(self): self.label = "3. Clip + Rename Geofabrik"
+
     def getParameterInfo(self):
-        return [arcpy.Parameter(name="in_ws", displayName="Input Workspace", datatype="DEWorkspace", parameterType="Required", direction="Input"),
-                arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input"),
-                arcpy.Parameter(name="clip", displayName="Clip Feature", datatype="GPFeatureLayer", parameterType="Required", direction="Input")] + list(make_sj_params()) + list(make_common())
+        return [
+            arcpy.Parameter(name="in_ws", displayName="Input Workspace (folder, gpkg, or pbf)", datatype="DEWorkspace", parameterType="Required", direction="Input"),
+            arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input"),
+            arcpy.Parameter(name="clip", displayName="Clip Feature", datatype="GPFeatureLayer", parameterType="Required", direction="Input")
+        ] + list(make_sj_params()) + list(make_common())
+
     def updateParameters(self, params):
         params[4].enabled = params[5].enabled = params[6].enabled = bool(params[3].value)
+
     def execute(self, params, messages):
-        in_ws, geo, clip_fc, out_ws, add_map = params[0].valueAsText, params[1].valueAsText, params[2].valueAsText, params[8].valueAsText, params[7].value
+        raw_ws = params[0].valueAsText
+        in_ws = normalize_input_workspace(raw_ws)
+
         arcpy.env.workspace = in_ws
+        geo = params[1].valueAsText
+        clip_fc = params[2].valueAsText
+        out_ws = params[8].valueAsText
+        add_map = params[7].value
+
         fcs = sorted(arcpy.ListFeatureClasses() or [], key=lambda x: resolve_mapping(x)[2], reverse=True)
+
         for fc in fcs:
             template, group, l_order = resolve_mapping(fc)
             if template:
                 new_name = template.format(geoextent=geo)
                 clipped = arcpy.analysis.Clip(os.path.join(in_ws, fc), clip_fc, arcpy.CreateUniqueName("c", arcpy.env.scratchGDB))
                 working = clipped
-                if params[3].value: 
+                if params[3].value:
                     working = run_sj(working, params[4].valueAsText, params[5].valueAsText, params[6].values)
                 copy_and_group(working, out_ws, new_name, group, add_map)
 
+
 class MergeClipRenameGeofabrik(object):
     def __init__(self): self.label = "4. Merge + Clip + Rename Geofabrik"
+
     def getParameterInfo(self):
-        return [arcpy.Parameter(name="in_ws", displayName="Input Workspaces", datatype="DEWorkspace", parameterType="Required", direction="Input", multiValue=True),
-                arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input"),
-                arcpy.Parameter(name="clip", displayName="Clip Feature", datatype="GPFeatureLayer", parameterType="Required", direction="Input")] + list(make_sj_params()) + list(make_common())
+        return [
+            arcpy.Parameter(name="in_ws", displayName="Input Workspaces (folder, gpkg, or pbf)", datatype="DEWorkspace", parameterType="Required", direction="Input", multiValue=True),
+            arcpy.Parameter(name="geo", displayName="Geoextent", datatype="GPString", parameterType="Required", direction="Input"),
+            arcpy.Parameter(name="clip", displayName="Clip Feature", datatype="GPFeatureLayer", parameterType="Required", direction="Input")
+        ] + list(make_sj_params()) + list(make_common())
+
     def updateParameters(self, params):
         params[4].enabled = params[5].enabled = params[6].enabled = bool(params[3].value)
+
     def execute(self, params, messages):
-        in_wss, geo, clip_fc, out_ws, add_map = params[0].values, params[1].valueAsText, params[2].valueAsText, params[8].valueAsText, params[7].value
+        raw_wss = params[0].values
+        in_wss = [normalize_input_workspace(ws) for ws in raw_wss]
+
+        geo = params[1].valueAsText
+        clip_fc = params[2].valueAsText
+        out_ws = params[8].valueAsText
+        add_map = params[7].value
+
         groups_dict = defaultdict(list)
+
         for ws in in_wss:
             arcpy.env.workspace = ws
             for fc in arcpy.ListFeatureClasses() or []:
                 key = fc.replace("main.", "").replace("_1", "")
-                if "_free" not in key and "_free" in fc: key += "_free"
+                if "_free" not in key and "_free" in fc:
+                    key += "_free"
                 groups_dict[key].append(os.path.join(ws, fc))
-        
+
         sorted_keys = sorted(groups_dict.keys(), key=lambda k: resolve_mapping(k)[2], reverse=True)
+
         for key in sorted_keys:
             template, group, l_order = resolve_mapping(key)
             if template:
@@ -210,6 +307,6 @@ class MergeClipRenameGeofabrik(object):
                 merged = arcpy.management.Merge(groups_dict[key], arcpy.CreateUniqueName("m", arcpy.env.scratchGDB))
                 clipped = arcpy.analysis.Clip(merged, clip_fc, arcpy.CreateUniqueName("c", arcpy.env.scratchGDB))
                 working = clipped
-                if params[3].value: 
+                if params[3].value:
                     working = run_sj(working, params[4].valueAsText, params[5].valueAsText, params[6].values)
                 copy_and_group(working, out_ws, new_name, group, add_map)
